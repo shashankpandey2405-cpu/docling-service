@@ -4,3 +4,4 @@ python-multipart>=0.0.12
 pydantic>=2.9.0
 pdfplumber>=0.11.0
 docling>=2.14.0
+pymupdf>=1.24.0

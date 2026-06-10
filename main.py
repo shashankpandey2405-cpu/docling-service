@@ -41,6 +41,10 @@ class ExtractBlock(BaseModel):
     table_id: str | None = None
     row: int | None = None
     col: int | None = None
+    color_r: float | None = None
+    color_g: float | None = None
+    color_b: float | None = None
+    zone: str | None = None
 
 
 class ExtractResponse(BaseModel):
@@ -118,6 +122,96 @@ def bbox_to_block(
         row=row,
         col=col,
     )
+
+
+def rect_iou(a: ExtractBlock, x: float, y: float, w: float, h: float) -> float:
+    ax2, ay2 = a.x + a.width, a.y + a.height
+    bx2, by2 = x + w, y + h
+    ox = max(0.0, min(ax2, bx2) - max(a.x, x))
+    oy = max(0.0, min(ay2, by2) - max(a.y, y))
+    inter = ox * oy
+    if inter <= 0:
+        return 0.0
+    union = a.width * a.height + w * h - inter
+    return inter / union if union > 0 else 0.0
+
+
+def classify_zones(blocks: list[ExtractBlock], page_heights: dict[int, float]) -> None:
+    for b in blocks:
+        page_h = page_heights.get(b.page_index, 792.0)
+        top = b.y / page_h
+        bottom = (b.y + b.height) / page_h
+        if bottom >= 0.9:
+            b.zone = "footer"
+        elif top <= 0.1:
+            b.zone = "header"
+        else:
+            b.zone = "body"
+
+
+def enrich_with_pymupdf(pdf_bytes: bytes, blocks: list[ExtractBlock]) -> list[ExtractBlock]:
+    try:
+        import fitz  # PyMuPDF
+    except ImportError:
+        return blocks
+
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        page_heights: dict[int, float] = {i: float(doc[i].rect.height) for i in range(len(doc))}
+        classify_zones(blocks, page_heights)
+
+        for page_idx in {b.page_index for b in blocks}:
+            if page_idx < 0 or page_idx >= len(doc):
+                continue
+            page = doc[page_idx]
+            page_h = float(page.rect.height)
+            spans: list[dict[str, Any]] = []
+            for block in page.get_text("dict").get("blocks", []):
+                if block.get("type") != 0:
+                    continue
+                for line in block.get("lines", []):
+                    for span in line.get("spans", []):
+                        text = str(span.get("text", "")).strip()
+                        bbox = span.get("bbox")
+                        if not text or not bbox:
+                            continue
+                        x0, y0, x1, y1 = bbox
+                        spans.append(
+                            {
+                                "x": float(x0),
+                                "y": page_h - float(y1),
+                                "width": float(x1 - x0),
+                                "height": float(y1 - y0),
+                                "size": float(span.get("size", 12)),
+                                "font": span.get("font"),
+                                "color": int(span.get("color", 0) or 0),
+                            }
+                        )
+
+            for pb in [b for b in blocks if b.page_index == page_idx]:
+                best: dict[str, Any] | None = None
+                best_iou = 0.0
+                for sp in spans:
+                    iou = rect_iou(pb, sp["x"], sp["y"], sp["width"], sp["height"])
+                    if iou > best_iou:
+                        best_iou = iou
+                        best = sp
+                if not best or best_iou < 0.1:
+                    continue
+                pb.font_size = max(pb.font_size, float(best["size"]))
+                if best.get("font"):
+                    pb.font_name = str(best["font"])
+                color = int(best.get("color", 0) or 0)
+                if color != 0:
+                    pb.color_r = ((color >> 16) & 255) / 255.0
+                    pb.color_g = ((color >> 8) & 255) / 255.0
+                    pb.color_b = (color & 255) / 255.0
+    finally:
+        doc.close()
+
+    colored = sum(1 for b in blocks if b.color_r is not None)
+    print(f"[pymupdf-enrich] blocks={len(blocks)} colored={colored}")
+    return blocks
 
 
 def iter_docling_blocks(doc: Any, page_offset: int, max_pages: int) -> tuple[list[ExtractBlock], int]:
@@ -200,6 +294,7 @@ def extract_with_docling(pdf_bytes: bytes, max_pages: int, page_offset: int) -> 
         result = get_converter().convert(tmp_path)
         doc = result.document
         blocks, tables_found = iter_docling_blocks(doc, page_offset, max_pages)
+        blocks = enrich_with_pymupdf(pdf_bytes, blocks)
         page_count = len(getattr(doc, "pages", {}) or {})
         return ExtractResponse(
             blocks=blocks,
@@ -249,6 +344,7 @@ def extract_with_pdfplumber(pdf_bytes: bytes, max_pages: int, page_offset: int) 
                 key += 1
         page_count = len(pdf.pages)
 
+    blocks = enrich_with_pymupdf(pdf_bytes, blocks)
     return ExtractResponse(blocks=blocks, page_count=page_count, engine="pdfplumber", tables_found=0)
 
 
