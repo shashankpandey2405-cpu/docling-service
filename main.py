@@ -99,8 +99,11 @@ def bbox_to_block(
     r = float(bbox.r)
     b = float(bbox.b)
     w = max(4.0, r - l)
-    h = max(4.0, b - t)
+    raw_h = max(4.0, b - t)
     clean = (text or "").strip()
+    est_lines = max(1, clean.count("\n") + 1, (len(clean) // max(40, int(w * 0.15))) + 1)
+    h = raw_h if raw_h >= 10 else max(12.0, est_lines * 11.0)
+    font_size = max(9.0, min(h * 0.88, 14.0))
     return ExtractBlock(
         id=block_id,
         page_index=page_no - 1,
@@ -109,7 +112,7 @@ def bbox_to_block(
         y=page_h - b,
         width=w,
         height=h,
-        font_size=max(8.0, h * 0.88),
+        font_size=font_size,
         block_type=block_type,
         table_id=table_id,
         row=row,
