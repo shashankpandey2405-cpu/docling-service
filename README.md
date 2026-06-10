@@ -1,63 +1,48 @@
 # DocLING extraction microservice
 
-Layout-aware PDF text + table extraction for PDFTrusted translate pipeline.
+Layout-aware PDF text + table extraction for [PDFTrusted](https://pdftrusted.com) translate pipeline.
 
-## Endpoints
+Repo: https://github.com/shashankpandey2405-cpu/docling-service
 
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/health` | Service status + engine |
-| POST | `/extract` | Upload PDF → bbox blocks JSON |
-
-## Run locally
-
-```bash
-cd repos/docling-service
-pip install -r requirements.txt
-uvicorn main:app --reload --port 8080
-```
-
-## Railway / Docker
-
-```bash
-docker build -t pdftrusted-docling .
-docker run -p 8080:8080 pdftrusted-docling
-```
-
-Set on AI worker:
-
-```
-DOCLING_URL=https://your-docling-service.railway.app
-DOCLING_EXTRACT_ENABLED=true
-```
-
-## Response shape
-
-Matches `TextBlock` in `server/translate/types.ts`:
+## Health
 
 ```json
 {
-  "blocks": [
-    {
-      "id": "d0",
-      "page_index": 0,
-      "text": "Experience",
-      "x": 72.0,
-      "y": 650.0,
-      "width": 120.0,
-      "height": 14.0,
-      "font_size": 12.0,
-      "block_type": "text"
-    }
-  ],
-  "page_count": 2,
-  "engine": "docling",
-  "tables_found": 1
+  "ok": true,
+  "docling_installed": true,
+  "engine": "auto",
+  "active_engine": "docling"
 }
 ```
 
+If `docling_installed: false` → only pdfplumber fallback (word-level, no tables).
+
+## Railway
+
+1. Memory **≥ 4 GB** (DocLING + PyTorch models).
+2. Public URL → set on AI worker:
+   ```
+   DOCLING_URL=https://docling-service-production-8769.up.railway.app
+   DOCLING_EXTRACT_ENABLED=true
+   ```
+3. Or private network (same project):
+   ```
+   DOCLING_URL=http://docling-service.railway.internal:8080
+   ```
+
+## API
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/health` | Status + whether DocLING is installed |
+| POST | `/extract?max_pages=10&page_offset=0` | Upload PDF → bbox blocks JSON |
+
 ## Engines
 
-- **docling** — full layout + tables (install `docling` package)
-- **pdfplumber** — fallback word-level bbox (always available)
-- **auto** (default) — DocLING if installed, else pdfplumber
+| Engine | Quality |
+|--------|---------|
+| **docling** | Tables, layout, reading order (best) |
+| **pdfplumber** | Word-level bbox fallback |
+| **auto** | DocLING if installed, else pdfplumber |
+
+Force engine: `DOCLING_ENGINE=docling` or `pdfplumber`

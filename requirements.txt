@@ -3,5 +3,4 @@ uvicorn[standard]>=0.32.0
 python-multipart>=0.0.12
 pydantic>=2.9.0
 pdfplumber>=0.11.0
-# Optional — install for full DocLING table/layout extraction:
-# docling>=2.0.0
+docling>=2.14.0
