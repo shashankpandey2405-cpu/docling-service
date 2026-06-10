@@ -1,7 +1,11 @@
 """
 DocLING layout extraction microservice for PDFTrusted translate pipeline.
 POST /extract?max_pages=10&page_offset=0 — PDF → bbox blocks + table cells.
-Falls back to pdfplumber when docling package is unavailable.
+
+Engine priority (DOCLING_ENGINE=auto):
+  1. docling (best layout, needs RapidOCR deps)
+  2. pymupdf line spans (digital PDFs — no OCR)
+  3. pdfplumber words (last resort)
 """
 from __future__ import annotations
 
@@ -55,6 +59,12 @@ class ExtractResponse(BaseModel):
 
 
 _converter = None
+_last_extract_error: str | None = None
+
+
+def reset_converter() -> None:
+    global _converter
+    _converter = None
 
 
 def docling_available() -> bool:
@@ -309,6 +319,66 @@ def extract_with_docling(pdf_bytes: bytes, max_pages: int, page_offset: int) -> 
             pass
 
 
+def extract_with_pymupdf_lines(pdf_bytes: bytes, max_pages: int, page_offset: int) -> ExtractResponse:
+    """Line-level extract via PyMuPDF — stable for digital CVs, no RapidOCR."""
+    import fitz
+
+    blocks: list[ExtractBlock] = []
+    seq = 0
+    page_heights: dict[int, float] = {}
+    page_count = 0
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        page_count = len(doc)
+        end = min(page_count, page_offset + max_pages)
+        for page_idx in range(page_offset, end):
+            page = doc[page_idx]
+            page_h = float(page.rect.height)
+            page_heights[page_idx] = page_h
+            for block in page.get_text("dict").get("blocks", []):
+                if block.get("type") != 0:
+                    continue
+                for line in block.get("lines", []):
+                    spans = line.get("spans", [])
+                    if not spans:
+                        continue
+                    parts = [str(s.get("text", "")) for s in spans if s.get("text")]
+                    text = "".join(parts).strip()
+                    if not text:
+                        continue
+                    x0 = min(float(s["bbox"][0]) for s in spans)
+                    y0 = min(float(s["bbox"][1]) for s in spans)
+                    x1 = max(float(s["bbox"][2]) for s in spans)
+                    y1 = max(float(s["bbox"][3]) for s in spans)
+                    max_size = max(float(s.get("size", 10) or 10) for s in spans)
+                    font_name = next((str(s.get("font")) for s in spans if s.get("font")), None)
+                    color = next((int(s.get("color", 0) or 0) for s in spans if s.get("color")), 0)
+                    eb = ExtractBlock(
+                        id=f"m{seq}",
+                        page_index=page_idx,
+                        text=text,
+                        x=x0,
+                        y=page_h - y1,
+                        width=max(1.0, x1 - x0),
+                        height=max(1.0, y1 - y0),
+                        font_size=max_size,
+                        font_name=font_name,
+                        block_type="text",
+                    )
+                    if color != 0:
+                        eb.color_r = ((color >> 16) & 255) / 255.0
+                        eb.color_g = ((color >> 8) & 255) / 255.0
+                        eb.color_b = (color & 255) / 255.0
+                    blocks.append(eb)
+                    seq += 1
+    finally:
+        doc.close()
+
+    classify_zones(blocks, page_heights)
+    print(f"[pymupdf-extract] blocks={len(blocks)} pages={page_count}")
+    return ExtractResponse(blocks=blocks, page_count=page_count, engine="pymupdf", tables_found=0)
+
+
 def extract_with_pdfplumber(pdf_bytes: bytes, max_pages: int, page_offset: int) -> ExtractResponse:
     import pdfplumber
 
@@ -348,16 +418,56 @@ def extract_with_pdfplumber(pdf_bytes: bytes, max_pages: int, page_offset: int) 
     return ExtractResponse(blocks=blocks, page_count=page_count, engine="pdfplumber", tables_found=0)
 
 
+def run_extract(pdf_bytes: bytes, max_pages: int, page_offset: int) -> ExtractResponse:
+    """Try docling first; fall back to pymupdf lines, then pdfplumber."""
+    global _last_extract_error
+
+    engine = os.getenv("DOCLING_ENGINE", "auto").lower()
+    use_docling = engine == "docling" or (engine == "auto" and docling_available())
+    use_pymupdf = engine in ("auto", "pymupdf", "pdfplumber")
+    use_pdfplumber = engine in ("auto", "pdfplumber")
+
+    if use_docling and docling_available():
+        try:
+            result = extract_with_docling(pdf_bytes, max_pages, page_offset)
+            if result.blocks:
+                _last_extract_error = None
+                return result
+            print("[extract] docling returned 0 blocks, trying pymupdf")
+        except Exception as exc:
+            _last_extract_error = str(exc)
+            print(f"[extract] docling failed ({exc}), falling back to pymupdf")
+            reset_converter()
+
+    if use_pymupdf and engine != "pdfplumber":
+        try:
+            result = extract_with_pymupdf_lines(pdf_bytes, max_pages, page_offset)
+            if result.blocks:
+                _last_extract_error = None
+                return result
+            print("[extract] pymupdf returned 0 blocks, trying pdfplumber")
+        except Exception as exc:
+            _last_extract_error = str(exc)
+            print(f"[extract] pymupdf failed ({exc}), trying pdfplumber")
+
+    if use_pdfplumber:
+        result = extract_with_pdfplumber(pdf_bytes, max_pages, page_offset)
+        _last_extract_error = None
+        return result
+
+    raise RuntimeError(_last_extract_error or "no extraction engine available")
+
+
 @app.get("/health")
 def health() -> dict[str, Any]:
     installed = docling_available()
     engine_env = os.getenv("DOCLING_ENGINE", "auto")
-    active = "docling" if (engine_env == "docling" or (engine_env == "auto" and installed)) else "pdfplumber"
     return {
         "ok": True,
         "docling_installed": installed,
         "engine": engine_env,
-        "active_engine": active,
+        "fallback_chain": ["docling", "pymupdf", "pdfplumber"],
+        "last_extract_error": _last_extract_error,
         "service": "docling-extract",
     }
 
@@ -372,12 +482,7 @@ async def extract(
     if not raw or raw[:4] != b"%PDF":
         raise HTTPException(status_code=400, detail="invalid_pdf")
 
-    engine = os.getenv("DOCLING_ENGINE", "auto").lower()
-    use_docling = engine == "docling" or (engine == "auto" and docling_available())
-
     try:
-        if use_docling and docling_available():
-            return extract_with_docling(raw, max_pages, page_offset)
-        return extract_with_pdfplumber(raw, max_pages, page_offset)
+        return run_extract(raw, max_pages, page_offset)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Extraction failed: {exc}") from exc
